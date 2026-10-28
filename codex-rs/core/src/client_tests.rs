@@ -203,7 +203,13 @@ async fn workspace_routed_http_rejects_redirects_without_a_routing_header() {
         // Exercise the resolved route's redirect policy against loopback HTTP servers.
         setup.api_provider.base_url = origin.uri();
         let transport = client
-            .build_api_transport(&setup.api_provider, "/responses", setup.redirect_policy)
+            .build_api_transport(
+                &setup.api_provider,
+                "/responses",
+                setup.redirect_policy,
+                setup.auth_owner_generation,
+                setup.auth_revision,
+            )
             .unwrap();
         let request = setup
             .api_provider
@@ -2122,4 +2128,121 @@ async fn intercepted_output_reaches_trace_and_websocket_bookkeeping() -> anyhow:
         serde_json::from_slice(&std::fs::read(temp.path().join(&payload.path))?)?;
     assert_eq!(recorded["output_items"], serde_json::to_value(&delivered)?);
     Ok(())
+}
+
+#[tokio::test]
+async fn api_http_client_reuses_connections_and_invalidates_auth_and_route_changes() {
+    use codex_client::HttpTransport;
+    use codex_login::default_client::ClientRedirectPolicy;
+    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncWriteExt;
+    use tokio::io::BufReader;
+    use tokio::net::TcpListener;
+    use tokio::task::JoinSet;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let accepted = Arc::clone(&connections);
+    let server = tokio::spawn(async move {
+        let mut handlers = JoinSet::new();
+        loop {
+            tokio::select! {
+                accepted_socket = listener.accept() => {
+                    let (socket, _) = accepted_socket.unwrap();
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    handlers.spawn(async move {
+                        let mut reader = BufReader::new(socket);
+                        loop {
+                            let mut authorization = String::new();
+                            loop {
+                                let mut line = String::new();
+                                if reader.read_line(&mut line).await.unwrap() == 0 {
+                                    return;
+                                }
+                                if line == "\r\n" {
+                                    break;
+                                }
+                                if line.to_ascii_lowercase().starts_with("authorization:") {
+                                    authorization = line.split_once(':').unwrap().1.trim().to_owned();
+                                }
+                            }
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nX-Seen-Authorization: {authorization}\r\n\r\n{{}}"
+                            );
+                            reader.get_mut().write_all(response.as_bytes()).await.unwrap();
+                        }
+                    });
+                }
+                Some(result) = handlers.join_next() => { result.unwrap(); }
+            }
+        }
+    });
+    let client = test_model_client(SessionSource::Exec);
+    let mut setup = client
+        .current_client_setup(super::ClientRouting::Workspace)
+        .await
+        .unwrap();
+    setup.api_provider.base_url = format!("http://{address}");
+    // Credentials change per request; they must not become cached transport headers.
+    let cases = [
+        (
+            "/responses",
+            ClientRedirectPolicy::Default,
+            Some(1),
+            Some(1),
+            1,
+        ),
+        (
+            "/responses",
+            ClientRedirectPolicy::Default,
+            Some(1),
+            Some(1),
+            1,
+        ),
+        (
+            "/responses",
+            ClientRedirectPolicy::Default,
+            Some(1),
+            Some(2),
+            2,
+        ),
+        (
+            "/responses",
+            ClientRedirectPolicy::Default,
+            Some(2),
+            Some(2),
+            3,
+        ),
+        ("/other", ClientRedirectPolicy::Default, Some(2), Some(2), 4),
+        ("/other", ClientRedirectPolicy::Reject, Some(2), Some(2), 5),
+    ];
+    for (index, (endpoint, redirects, owner, revision, expected_connections)) in
+        cases.into_iter().enumerate()
+    {
+        let bearer = format!("Bearer request-{index}");
+        setup
+            .api_provider
+            .headers
+            .insert(http::header::AUTHORIZATION, bearer.parse().unwrap());
+        // Clones represent repeated model turns from the same session-scoped owner.
+        let transport = client
+            .clone()
+            .build_api_transport(&setup.api_provider, endpoint, redirects, owner, revision)
+            .unwrap();
+        let request = setup
+            .api_provider
+            .build_request(http::Method::GET, endpoint);
+        let response = tokio::time::timeout(Duration::from_secs(5), transport.execute(request))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.headers["x-seen-authorization"].to_str().unwrap(),
+            bearer
+        );
+        assert_eq!(connections.load(Ordering::SeqCst), expected_connections);
+    }
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
 }
