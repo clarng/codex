@@ -70,6 +70,7 @@ use codex_api::build_session_headers;
 use codex_api::create_text_param_for_request;
 use codex_api::response_create_client_metadata;
 use codex_http_client::ClientRouteClass;
+use codex_http_client::HttpClient;
 use codex_http_client::HttpClientFactory;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
@@ -269,9 +270,24 @@ pub struct ModelClient {
     codex_responses_headers: Option<Arc<CodexResponsesHeaders>>,
     event_sender: Option<Sender<ProtocolEvent>>,
     http_client_factory: HttpClientFactory,
+    cached_http_client: Arc<StdMutex<Option<CachedApiHttpClient>>>,
     restored_history: bool,
     request_contributors: Vec<Arc<dyn codex_extension_api::ModelRequestContributor>>,
     executed_tool_calls: Option<ExecutedToolCalls>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ApiHttpClientKey {
+    url: String,
+    reject_redirects: bool,
+    auth_owner_generation: Option<u64>,
+    auth_revision: Option<u64>,
+}
+
+#[derive(Debug)]
+struct CachedApiHttpClient {
+    key: ApiHttpClientKey,
+    client: HttpClient,
 }
 
 /// A turn-scoped streaming session created from a [`ModelClient`].
@@ -538,6 +554,7 @@ impl ModelClient {
             codex_responses_headers: None,
             event_sender: None,
             http_client_factory,
+            cached_http_client: Arc::default(),
             restored_history: false,
             request_contributors,
             executed_tool_calls: None,
@@ -690,6 +707,8 @@ impl ModelClient {
             &api_provider,
             REALTIME_CALLS_ENDPOINT,
             client_setup.redirect_policy,
+            client_setup.auth_owner_generation,
+            client_setup.auth_revision,
         )?;
         let response = ApiRealtimeCallClient::new(transport, api_provider, client_setup.api_auth)
             .create_with_session_and_headers(sdp, session_config, extra_headers)
@@ -742,6 +761,8 @@ impl ModelClient {
             &client_setup.api_provider,
             MEMORIES_SUMMARIZE_ENDPOINT,
             client_setup.redirect_policy,
+            client_setup.auth_owner_generation,
+            client_setup.auth_revision,
         )?;
         let request_telemetry = Self::build_request_telemetry(
             session_telemetry,
@@ -1178,6 +1199,8 @@ impl ModelClient {
         api_provider: &ApiProvider,
         endpoint: &str,
         redirect_policy: ClientRedirectPolicy,
+        auth_owner_generation: Option<u64>,
+        auth_revision: Option<u64>,
     ) -> Result<ReqwestTransport> {
         let redirect_policy = if api_provider
             .headers
@@ -1187,13 +1210,32 @@ impl ModelClient {
         } else {
             redirect_policy
         };
+        let key = ApiHttpClientKey {
+            url: api_provider.url_for_path(endpoint),
+            reject_redirects: matches!(redirect_policy, ClientRedirectPolicy::Reject),
+            auth_owner_generation,
+            auth_revision,
+        };
+        let mut cached = self
+            .cached_http_client
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cached.as_ref()
+            && entry.key == key
+        {
+            return Ok(ReqwestTransport::from_http_client(entry.client.clone()));
+        }
         let client = create_client_for_route(
             &self.http_client_factory,
-            &api_provider.url_for_path(endpoint),
+            &key.url,
             ClientRouteClass::Api,
             redirect_policy,
         )
         .map_err(std::io::Error::from)?;
+        *cached = Some(CachedApiHttpClient {
+            key,
+            client: client.clone(),
+        });
         Ok(ReqwestTransport::from_http_client(client))
     }
 
@@ -1677,6 +1719,8 @@ impl ModelClientSession {
                 &client_setup.api_provider,
                 "/responses",
                 client_setup.redirect_policy,
+                client_setup.auth_owner_generation,
+                client_setup.auth_revision,
             )?;
             let request_auth_context = AuthRequestTelemetryContext::new(
                 client_setup.auth.as_ref().map(CodexAuth::auth_mode),

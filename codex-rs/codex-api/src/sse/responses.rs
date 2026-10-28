@@ -525,7 +525,8 @@ async fn process_sse_with_treatment(
     telemetry: Option<Arc<dyn SseTelemetry>>,
     safety_buffering_treatment: SafetyBufferingTreatment,
 ) {
-    let mut stream = stream.eventsource();
+    let mut body = stream;
+    let mut stream = body.by_ref().eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut last_server_model: Option<String> = None;
 
@@ -630,6 +631,23 @@ async fn process_sse_with_treatment(
                     return;
                 }
                 if is_completed {
+                    // Completion must reach the caller immediately, while the HTTP body
+                    // reaches EOF so its connection can return to the shared pool.
+                    drop(tx_event);
+                    drop(stream);
+                    let _ = timeout(Duration::from_millis(250), async {
+                        let mut bytes = 0;
+                        for _ in 0..16 {
+                            let Some(Ok(chunk)) = body.next().await else {
+                                break;
+                            };
+                            bytes += chunk.len();
+                            if bytes >= 64 * 1024 {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
                     return;
                 }
             }
@@ -944,6 +962,55 @@ mod tests {
             } if item_id == "ctc_1" && call_id == "call_1" && delta == "*** Begin"
         );
         assert_matches!(&events[1], ResponseEvent::Completed { .. });
+    }
+
+    #[tokio::test]
+    async fn completed_closes_event_channel_then_drains_http_body_to_eof() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
+
+        let eof_polled = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&eof_polled);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let finish_body = Arc::clone(&release);
+        let completion = Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp1\"}}\n\n",
+        );
+        let body = stream::once(async { Ok(completion) })
+            .chain(stream::once(async move {
+                finish_body.notified().await;
+                Ok(Bytes::from_static(b"\n"))
+            }))
+            .chain(stream::poll_fn(move |_| {
+                observed.store(true, Ordering::SeqCst);
+                std::task::Poll::Ready(None)
+            }));
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(process_sse(Box::pin(body), tx, idle_timeout(), None));
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. })));
+        assert!(rx.recv().await.is_none());
+        assert!(!eof_polled.load(Ordering::SeqCst));
+        release.notify_one();
+        timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(eof_polled.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_body_drain_is_bounded_for_a_stalled_peer() {
+        let completion = Bytes::from_static(
+            b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp1\"}}\n\n",
+        );
+        let body = stream::once(async { Ok(completion) }).chain(stream::pending());
+        let (tx, mut rx) = mpsc::channel(8);
+        let task = tokio::spawn(process_sse(Box::pin(body), tx, idle_timeout(), None));
+        assert_matches!(rx.recv().await, Some(Ok(ResponseEvent::Completed { .. })));
+        assert!(rx.recv().await.is_none());
+        assert!(!task.is_finished());
+        tokio::time::advance(Duration::from_millis(251)).await;
+        task.await.unwrap();
     }
 
     #[tokio::test]
